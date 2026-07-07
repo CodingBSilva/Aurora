@@ -1,0 +1,249 @@
+version: '3.8'
+
+networks:
+  aurora_network:
+    name: aurora_network_${ENV_PROFILE}
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+
+services:
+
+  # --------------------
+  # PostgreSQL
+  # --------------------
+  postgres:
+    image: postgres:13
+    container_name: aurora-postgres-${ENV_PROFILE}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - aurora_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # --------------------
+  # Postgres init (MLflow DB)
+  # --------------------
+  postgres-init:
+    image: postgres:13
+    container_name: aurora-postgres-init-${ENV_PROFILE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - aurora_network
+    entrypoint: >
+      bash -c "
+      echo 'Checking MLflow DB...';
+      psql -h postgres -U ${POSTGRES_USER} -tc \"SELECT 1 FROM pg_database WHERE datname='mlflow'\" 
+      | grep -q 1 || psql -h postgres -U ${POSTGRES_USER} -c \"CREATE DATABASE mlflow\";
+      echo 'Done.';
+      "
+
+  # --------------------
+  # Airflow init
+  # --------------------
+  airflow-init:
+    image: apache/airflow:2.8.1
+    container_name: aurora-airflow-init-${ENV_PROFILE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/airflow
+    networks:
+      - aurora_network
+    entrypoint: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create --username ${AIRFLOW_USERNAME} --password ${AIRFLOW_PASSWORD} --firstname ${AIRFLOW_FIRST_NAME} --lastname ${AIRFLOW_LAST_NAME} --role Admin --email ${AIRFLOW_EMAIL} || true
+      "
+
+  # --------------------
+  # Airflow Webserver
+  # --------------------
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    container_name: aurora-airflow-webserver-${ENV_PROFILE}
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "${AIRFLOW_WEB_PORT}:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./jobs:/opt/airflow/jobs
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/airflow
+    networks:
+      - aurora_network
+    command: webserver
+    restart: always
+
+  # --------------------
+  # Airflow Scheduler
+  # --------------------
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    container_name: aurora-airflow-scheduler-${ENV_PROFILE}
+    depends_on:
+      airflow-webserver:
+        condition: service_started
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./jobs:/opt/airflow/jobs
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/airflow
+    networks:
+      - aurora_network
+    command: scheduler
+    restart: always
+
+  # --------------------
+  # MinIO (Data Lake)
+  # --------------------
+  minio:
+    image: minio/minio
+    container_name: aurora-minio-${ENV_PROFILE}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - aurora_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: always
+
+  # --------------------
+  # MinIO Provisioning Client
+  # --------------------
+  minio-client:
+    image: minio/mc
+    container_name: aurora-minio-client-${ENV_PROFILE}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - aurora_network
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb local/datalake || true;
+      mc mb local/datalake/raw || true;
+      mc mb local/datalake/processed || true;
+      mc mb local/datalake/curated || true;
+      "
+
+  # --------------------
+  # Spark Master
+  # --------------------
+  spark-master:
+    image: spark-custom:latest
+    container_name: aurora-spark-master-${ENV_PROFILE}
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "${SPARK_MASTER_PORT}:8080"
+      - "7077:7077"
+    volumes:
+      - ./jobs:/opt/spark/jobs
+    networks:
+      - aurora_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: always
+
+  # --------------------
+  # Spark Worker
+  # --------------------
+  spark-worker:
+    image: spark-custom:latest
+    container_name: aurora-spark-worker-${ENV_PROFILE}
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ./jobs:/opt/spark/jobs
+    networks:
+      - aurora_network
+    restart: always
+
+  # --------------------
+  # MLflow
+  # --------------------
+  mlflow:
+    image: mlflow-custom:latest
+    container_name: aurora-mlflow-${ENV_PROFILE}
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    ports:
+      - "${MLFLOW_PORT}:5000"
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      --default-artifact-root s3://datalake/mlflow
+      --host 0.0.0.0
+      --port 5000
+    networks:
+      - aurora_network
+    restart: always
+
+  # --------------------
+  # Jupyter Notebook
+  # --------------------
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: aurora-jupyter-${ENV_PROFILE}
+    ports:
+      - "${JUPYTER_PORT}:8888"
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN}
+      PYSPARK_MASTER: "spark://spark-master:7077"
+      PYSPARK_SUBMIT_ARGS: "--packages org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 pyspark-shell"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./jobs:/home/jovyan/jobs
+    networks:
+      - aurora_network
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    restart: always
