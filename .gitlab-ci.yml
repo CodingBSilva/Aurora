@@ -1,0 +1,83 @@
+stages:
+  - validate
+  - build
+  - deploy
+
+before_script:
+  - echo "Starting CI/CD pipeline for Aurora Platform..."
+
+# -----------------------
+# VALIDATE ARCHITECTURE
+# -----------------------
+lint:
+  tags:
+    - docker
+  stage: validate
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "Validating compose layout structure generically..."
+    # Copy template to .env so validation doesn't throw blank variable warnings
+    - if [ -f .env.example ]; then cp .env.example .env; fi
+    - docker compose config -q
+
+# -----------------------
+# BUILD IMAGES
+# -----------------------
+build:
+  tags: 
+    - docker
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "Building Spark image..."
+    - docker build -t spark-custom:latest ./docker/spark
+    - echo "Building MLflow image..."
+    - docker build -t mlflow-custom:latest ./docker/mlflow
+  only:
+    - main
+
+# -----------------------
+# DEPLOY
+# -----------------------
+deploy:
+  tags: 
+    - docker
+  stage: deploy
+  before_script:
+    - echo "Preparing runtime environment variables from template..."
+    # Automatically convert the tracked template file into the active .env profile
+    - |
+      if [ -f .env.example ]; then
+        echo "Instantiating active .env configuration file..."
+        cp .env.example .env
+        # Dynamically ensure ENV_PROFILE is marked for tracking metrics
+        sed -i 's/ENV_PROFILE=.*/ENV_PROFILE=production/g' .env 2>/dev/null || true
+      else
+        echo "WARNING: .env.example file not found in repository!"
+      fi
+  script:
+    - echo "Pulling standard remote target states..."
+    - docker compose pull --ignore-pull-failures || true
+    
+    - echo "Programmatically cleaning active environments..."
+    - |
+      ACTIVE_IDS=$(docker compose ps -a -q 2>/dev/null || true)
+      if [ ! -z "$ACTIVE_IDS" ]; then
+        echo "Removing running stack containers cleanly: $ACTIVE_IDS"
+        docker rm -f $ACTIVE_IDS || true
+      fi
+    
+    - echo "Resetting stack configuration mapping and orphans..."
+    - docker compose down --volumes --remove-orphans
+    
+    - echo "Spinning up platform tracking stack..."
+    - docker compose up -d --force-recreate --remove-orphans
+
+    - echo "Deployment complete. Checking health status..."
+    - docker compose ps
+  only:
+    - main
